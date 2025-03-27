@@ -3,6 +3,10 @@
 let apiKey;
 let sessionId;
 let token;
+let session;
+let isPublisherPublished = false; // Track if the publisher is successfully published
+let publishAttempts = 0; // Track publish attempts
+const MAX_PUBLISH_ATTEMPTS = 3; // Limit publish attempts
 
 function logError(type, error) {
   if (error) {
@@ -28,8 +32,11 @@ function handlePublisherError(error) {
   if (error) {
     logError("Publisher", error);
 
-    if (error.code === 1500) {
-      console.log("Attempting to retry publisher initialization...");
+    if (publishAttempts < MAX_PUBLISH_ATTEMPTS) {
+      publishAttempts++;
+      console.log(
+        `Retrying publisher initialization (Attempt ${publishAttempts})...`
+      );
       retryInitPublisher(
         "publisher",
         {
@@ -37,9 +44,8 @@ function handlePublisherError(error) {
           width: "100%",
           height: "100%",
         },
-        3, // Retry up to 3 times
+        1, // Retry only once during re-publish
         (publisher) => {
-          console.log("Publisher reinitialized successfully.");
           session.publish(publisher, handlePublisherError);
         },
         (retryError) => {
@@ -53,8 +59,14 @@ function handlePublisherError(error) {
         }
       );
     } else {
-      console.error("Unrecoverable publisher error:", error.message);
+      console.error("Max publish attempts reached. Unable to publish.");
+      alert(
+        "Unable to publish your stream. Please refresh the page and try again."
+      );
     }
+  } else {
+    isPublisherPublished = true;
+    console.log("Publisher successfully published to the session.");
   }
 }
 
@@ -113,7 +125,7 @@ OT.on("exception", (event) => {
       code: event.code,
       message: event.message,
     });
-    console.error("Exception Details:", event);
+    // console.error("Exception Details:", event);
   }
 });
 
@@ -126,69 +138,98 @@ document.getElementById("simulateException").addEventListener("click", () => {
 });
 
 function initializeSession() {
-  const session = OT.initSession(apiKey, sessionId);
+  session = OT.initSession(apiKey, sessionId); // Initialize the session
 
   // Subscribe to a newly created stream
   session.on("streamCreated", (event) => {
+    console.log("New stream created. Subscribing...");
     const subscriberOptions = {
       insertMode: "append",
       width: "100%",
       height: "100%",
     };
+
+    // Create a unique container for the subscriber
+    const subscriberContainer = document.createElement("div");
+    subscriberContainer.id = `subscriber-${event.stream.streamId}`;
+    document.getElementById("subscribers").appendChild(subscriberContainer);
+
     session.subscribe(
       event.stream,
-      "subscriber",
+      subscriberContainer.id,
       subscriberOptions,
       handleSubscribeError
     );
   });
 
-  session.on("connectionDestroyed", (event) => {
-    console.warn("A connection was destroyed:", event.reason);
-  });
-
-  session.on("sessionDisconnected", (event) => {
-    console.warn("You were disconnected from the session:", event.reason);
-    if (event.reason === "networkDisconnected") {
-      console.warn(
-        "You were disconnected due to network issues. Please check your connection."
-      );
-    }
-  });
-
+  // Handle stream destruction
   session.on("streamDestroyed", (event) => {
     console.warn("A stream was destroyed:", event.reason);
+
+    // Remove the corresponding subscriber container
+    const subscriberContainer = document.getElementById(
+      `subscriber-${event.stream.streamId}`
+    );
+    if (subscriberContainer) {
+      subscriberContainer.remove();
+    }
+
     if (event.reason === "networkDisconnected") {
       console.warn("A stream was lost due to network issues.");
     }
   });
 
-  // Initialize the publisher
-  const publisherOptions = {
-    insertMode: "append",
-    width: "100%",
-    height: "100%",
-  };
+  // Handle connection destruction
+  session.on("connectionDestroyed", (event) => {
+    console.warn("A connection was destroyed:", event.reason);
+    // Optionally, notify other participants about the disconnection
+  });
 
-  retryInitPublisher(
-    "publisher", // Target element ID
-    publisherOptions,
-    3, // Maximum retries
-    (publisher) => {
-      // Success callback: Publish the publisher to the session
-      session.publish(publisher, handlePublisherError);
-    },
-    (error) => {
-      // Error callback: Handle the failure
-      console.error(
-        "Failed to initialize the publisher after 3 attempts:",
-        error.message
-      );
-      console.warn(
-        "Unable to initialize the publisher. Please check your connection and try again."
-      );
+  // Handle session disconnection
+  session.on("sessionDisconnected", (event) => {
+    console.warn("You were disconnected from the session:", event.reason);
+
+    // Clean up the publisher UI
+    const publisherContainer = document.getElementById("publisher");
+    if (publisherContainer) {
+      publisherContainer.innerHTML = ""; // Clear the publisher container
     }
-  );
+
+    if (event.reason === "networkDisconnected") {
+      console.warn(
+        "You were disconnected due to network issues. Attempting to reconnect..."
+      );
+
+      // Attempt to reconnect
+      session.connect(token, (error) => {
+        if (error) {
+          console.error("Failed to reconnect to the session:", error.message);
+        } else {
+          console.log("Reconnected to the session successfully.");
+
+          // Reinitialize and republish the publisher
+          retryInitPublisher(
+            "publisher",
+            {
+              insertMode: "append",
+              width: "100%",
+              height: "100%",
+            },
+            3, // Maximum retries
+            (publisher) => {
+              session.publish(publisher, handlePublisherError);
+            },
+            (error) => {
+              console.error(
+                "Failed to reinitialize the publisher after reconnection:",
+                error.message
+              );
+            }
+          );
+        }
+      });
+    }
+  });
 
   // Connect to the session
   session.connect(token, (error) => {
@@ -196,7 +237,33 @@ function initializeSession() {
       handleSessionError(error);
     } else {
       console.log("Session connected successfully.");
-      session.publish(publisher, handlePublisherError);
+
+      // Initialize the publisher only after the session is connected
+      const publisherOptions = {
+        insertMode: "append",
+        width: "100%",
+        height: "100%",
+      };
+
+      retryInitPublisher(
+        "publisher", // Target element ID
+        publisherOptions,
+        3, // Maximum retries
+        (publisher) => {
+          // Success callback: Publish the publisher to the session
+          session.publish(publisher, handlePublisherError);
+        },
+        (error) => {
+          // Error callback: Handle the failure
+          console.error(
+            "Failed to initialize the publisher after 3 attempts:",
+            error.message
+          );
+          console.warn(
+            "Unable to initialize the publisher. Please check your connection and try again."
+          );
+        }
+      );
     }
   });
 }
